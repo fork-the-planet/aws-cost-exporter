@@ -14,6 +14,9 @@ from prometheus_client import Gauge
 # This prevents hitting AWS API rate limits when iterating over many dimension values
 ITERATE_DELAY_SECONDS = 0.2
 
+# Label name added to metrics when metric_types (list) is used instead of metric_type (string).
+METRIC_TYPE_LABEL = "MetricType"
+
 
 class MetricExporter:
     def __init__(
@@ -25,12 +28,13 @@ class MetricExporter:
         aws_assumed_role_name,
         group_by,
         targets,
-        metric_type,
+        metric_type=None,
+        metric_types=None,
         data_delay_days=0,
         metric_description=None,
         record_types=None,
-        tag_filters=None,  # Added tag_filters parameter
-        dimension_filters=None,  # Added dimension_filters parameter for filtering by AWS dimensions
+        tag_filters=None,
+        dimension_filters=None,
         granularity="DAILY",
     ):
         self.polling_interval_seconds = polling_interval_seconds
@@ -40,12 +44,26 @@ class MetricExporter:
         self.aws_access_secret = aws_access_secret
         self.aws_assumed_role_name = aws_assumed_role_name
         self.group_by = group_by
-        self.metric_type = metric_type  # Store metrics
         self.data_delay_days = data_delay_days
         self.metric_description = metric_description
-        self.tag_filters = tag_filters  # Store tag filters
+        self.tag_filters = tag_filters
         self.granularity = granularity
-        self.dimension_alias = {}  # Store dimension value alias per group
+        self.dimension_alias = {}
+
+        # Normalize metric_type / metric_types into a single list.
+        #
+        # - metric_type (str): legacy single-value form; no MetricType label is added to
+        #   exported metrics so existing dashboards and queries are not broken.
+        # - metric_types (list): new multi-value form; a MetricType label is added to every
+        #   exported metric so the values can be distinguished in Prometheus/Grafana.
+        #
+        # Exactly one of the two must be supplied; validation in main.py enforces this.
+        if metric_types is not None:
+            self.metric_types = list(metric_types)
+            self.add_metric_type_label = True
+        else:
+            self.metric_types = [metric_type]
+            self.add_metric_type_label = False
 
         # Process dimension_filters: separate iterate vs static filters
         # - iterate=true: Makes N API requests (one per value), adds values as labels
@@ -62,15 +80,18 @@ class MetricExporter:
 
         # We have verified that there is at least one target
         self.labels = set(targets[0].keys())
-
-        # For now we only support exporting one type of cost (Usage)
         self.labels.add("ChargeType")
 
-        # If record_types is not provided, determine default based on metric_type
-        # For amortized cost types, we need to include additional record types to get accurate values
+        # When using metric_types, add MetricType as a label dimension.
+        if self.add_metric_type_label:
+            self.labels.add(METRIC_TYPE_LABEL)
+
+        # If record_types is not provided, determine default based on metric_types.
+        # For amortized cost types, we need to include Savings Plan and Reserved Instance
+        # related record types to get accurate amortized values.
         if record_types is None:
-            self.record_types = self._get_default_record_types(metric_type)
-            logging.info(f"Using default record_types for {metric_type}: {self.record_types}")
+            self.record_types = self._get_default_record_types(self.metric_types)
+            logging.info(f"Using default record_types for {self.metric_types}: {self.record_types}")
         else:
             self.record_types = record_types
 
@@ -78,7 +99,6 @@ class MetricExporter:
             for group in group_by["groups"]:
                 # Handle dimension alias if present
                 if group["type"] == "DIMENSION" and "alias" in group:
-                    # Store the alias mapping for this dimension
                     self.dimension_alias[group["key"]] = {
                         "map": group["alias"]["map"],
                         "label": group["alias"]["label_name"],
@@ -88,7 +108,6 @@ class MetricExporter:
                 self.labels.add(group["label_name"])
 
         # Add labels from iterate dimension_filters
-        # These labels will be populated with values during iteration
         for df in self.iterate_filters:
             if "label_name" in df:
                 self.labels.add(df["label_name"])
@@ -106,32 +125,26 @@ class MetricExporter:
             self.labels,
         )
 
-    def _get_default_record_types(self, metric_type):
+    def _get_default_record_types(self, metric_types):
         """
-        Returns appropriate default record types based on the metric type.
+        Returns appropriate default record types based on the requested metric types.
 
-        For AmortizedCost and NetAmortizedCost, we need to include Savings Plan and
-        Reserved Instance related record types to get accurate amortized values.
-        Without these, amortized costs will appear the same as unblended costs.
+        If any requested type is AmortizedCost or NetAmortizedCost, include the Savings
+        Plan and Reserved Instance record types needed for accurate amortized values.
 
         See: https://github.com/electrolux-oss/aws-cost-exporter/issues/27
         See: https://github.com/electrolux-oss/aws-cost-exporter/issues/30
         """
-        # Base record types for all metric types
         base_types = ["Usage"]
+        amortized_types = {"AmortizedCost", "NetAmortizedCost"}
 
-        # Amortized cost types need additional record types for accurate calculation
-        amortized_types = ["AmortizedCost", "NetAmortizedCost"]
-
-        if metric_type in amortized_types:
-            # Include Savings Plan and Reserved Instance related record types
-            # These are required to properly calculate amortized costs
+        if any(mt in amortized_types for mt in metric_types):
             return base_types + [
                 "SavingsPlanCoveredUsage",
                 "SavingsPlanRecurringFee",
                 "SavingsPlanUpfrontFee",
-                "DiscountedUsage",  # For Reserved Instance usage
-                "RIFee",  # For Reserved Instance fees
+                "DiscountedUsage",
+                "RIFee",
             ]
 
         return base_types
@@ -144,10 +157,8 @@ class MetricExporter:
             logging.info("Querying cost data for AWS account %s" % aws_account["Publisher"])
             try:
                 if self.iterate_filters:
-                    # Use iteration mode when iterate dimension_filters are configured
                     self._run_with_iteration(aws_account)
                 else:
-                    # Use standard mode with static filters only
                     self._fetch_with_filters(aws_account, self.static_filters, {})
             except Exception as e:
                 logging.error(e)
@@ -170,15 +181,11 @@ class MetricExporter:
         values = iterate_filter.get("values", [])
 
         for i, value in enumerate(values):
-            # Rate limiting: delay between requests to avoid hitting AWS API limits
             if i > 0:
                 time.sleep(ITERATE_DELAY_SECONDS)
 
-            # Build dimension filter for this specific value
             current_filters = self.static_filters + [{"key": iterate_filter["key"], "values": [value]}]
 
-            # Build extra labels from iterate filter
-            # These labels are added to each metric with the current iteration value
             iterate_labels = {}
             if "label_name" in iterate_filter:
                 iterate_labels[iterate_filter["label_name"]] = value
@@ -193,6 +200,39 @@ class MetricExporter:
                 logging.error(f"Error fetching for {iterate_filter['key']}={value}: {e}")
                 continue
 
+    def _parse_group_key_values(self, item):
+        """Extract label:value pairs from a Cost Explorer result group item."""
+        group_key_values = {}
+        for i, group in enumerate(self.group_by["groups"]):
+            if group["type"] == "TAG":
+                value = item["Keys"][i].split("$")[1]
+                group_key_values[group["label_name"]] = value
+            else:
+                value = item["Keys"][i]
+                if group["type"] == "DIMENSION" and group["key"] in self.dimension_alias:
+                    alias = self.dimension_alias[group["key"]]
+                    group_key_values[group["label_name"]] = value
+                    alias_value = alias["map"].get(value)
+                    group_key_values[alias["label"]] = alias_value if alias_value is not None else ""
+                else:
+                    group_key_values[group["label_name"]] = value
+        return group_key_values
+
+    def _build_merged_group_key_values(self):
+        """Build label:value pairs for the merge_minor_cost catch-all group."""
+        group_key_values = {}
+        merged_value = self.group_by["merge_minor_cost"]["tag_value"]
+        for group in self.group_by["groups"]:
+            if group["type"] == "DIMENSION" and group["key"] in self.dimension_alias:
+                alias = self.dimension_alias[group["key"]]
+                group_key_values[group["label_name"]] = merged_value
+                alias_value = alias["map"].get(merged_value)
+                if alias_value is not None:
+                    group_key_values[alias["label"]] = alias_value
+            else:
+                group_key_values[group["label_name"]] = merged_value
+        return group_key_values
+
     def _fetch_with_filters(self, aws_account, dimension_filters, extra_labels):
         """
         Fetch cost data with specified dimension filters and add extra labels.
@@ -204,7 +244,6 @@ class MetricExporter:
         """
         aws_client = self._get_aws_client(aws_account)
 
-        # Pass both tag_filters and dimension_filters to query_aws_cost_explorer
         cost_response = self.query_aws_cost_explorer(
             aws_client,
             self.group_by,
@@ -214,61 +253,39 @@ class MetricExporter:
 
         for result in cost_response:
             if not self.group_by["enabled"]:
-                cost = float(result["Total"][self.metric_type]["Amount"])
-                self.cost_metric.labels(**aws_account, **extra_labels, ChargeType="Usage").set(cost)
+                for metric_type in self.metric_types:
+                    cost = float(result["Total"][metric_type]["Amount"])
+                    type_label = {METRIC_TYPE_LABEL: metric_type} if self.add_metric_type_label else {}
+                    self.cost_metric.labels(**aws_account, **extra_labels, **type_label, ChargeType="Usage").set(cost)
             else:
-                merged_minor_cost = 0
+                # Track merged minor costs separately per metric type so that the threshold
+                # check is applied independently for each cost view.
+                merged_minor_costs = {mt: 0.0 for mt in self.metric_types}
+
                 for item in result["Groups"]:
-                    cost = float(item["Metrics"][self.metric_type]["Amount"])
+                    group_key_values = self._parse_group_key_values(item)
 
-                    group_key_values = dict()
-                    for i in range(len(self.group_by["groups"])):
-                        group = self.group_by["groups"][i]
-                        if group["type"] == "TAG":
-                            value = item["Keys"][i].split("$")[1]
-                            group_key_values[group["label_name"]] = value
+                    for metric_type in self.metric_types:
+                        cost = float(item["Metrics"][metric_type]["Amount"])
+                        type_label = {METRIC_TYPE_LABEL: metric_type} if self.add_metric_type_label else {}
+
+                        if (
+                            self.group_by["merge_minor_cost"]["enabled"]
+                            and cost < self.group_by["merge_minor_cost"]["threshold"]
+                        ):
+                            merged_minor_costs[metric_type] += cost
                         else:
-                            value = item["Keys"][i]
-                            # Check if this dimension has alias
-                            if group["type"] == "DIMENSION" and group["key"] in self.dimension_alias:
-                                alias = self.dimension_alias[group["key"]]
-                                # Add both original and aliased values
-                                group_key_values[group["label_name"]] = value
-                                alias_value = alias["map"].get(value)
-                                if alias_value is not None:
-                                    group_key_values[alias["label"]] = alias_value
-                                else:
-                                    group_key_values[alias["label"]] = ""
-                            else:
-                                group_key_values[group["label_name"]] = value
+                            self.cost_metric.labels(
+                                **aws_account, **extra_labels, **group_key_values, **type_label, ChargeType="Usage"
+                            ).set(cost)
 
-                    if (
-                        self.group_by["merge_minor_cost"]["enabled"]
-                        and cost < self.group_by["merge_minor_cost"]["threshold"]
-                    ):
-                        merged_minor_cost += cost
-                    else:
+                merged_group_key_values = self._build_merged_group_key_values()
+                for metric_type, merged_cost in merged_minor_costs.items():
+                    if merged_cost > 0:
+                        type_label = {METRIC_TYPE_LABEL: metric_type} if self.add_metric_type_label else {}
                         self.cost_metric.labels(
-                            **aws_account, **extra_labels, **group_key_values, ChargeType="Usage"
-                        ).set(cost)
-
-                if merged_minor_cost > 0:
-                    group_key_values = dict()
-                    for i in range(len(self.group_by["groups"])):
-                        group = self.group_by["groups"][i]
-                        merged_value = self.group_by["merge_minor_cost"]["tag_value"]
-                        if group["type"] == "DIMENSION" and group["key"] in self.dimension_alias:
-                            alias = self.dimension_alias[group["key"]]
-                            # Add both original and aliased values for merged costs
-                            group_key_values[group["label_name"]] = merged_value
-                            alias_value = alias["map"].get(merged_value)
-                            if alias_value is not None:
-                                group_key_values[alias["label"]] = alias_value
-                        else:
-                            group_key_values[group["label_name"]] = merged_value
-                    self.cost_metric.labels(**aws_account, **extra_labels, **group_key_values, ChargeType="Usage").set(
-                        merged_minor_cost
-                    )
+                            **aws_account, **extra_labels, **merged_group_key_values, **type_label, ChargeType="Usage"
+                        ).set(merged_cost)
 
     def _get_aws_client(self, aws_account):
         """
@@ -280,7 +297,6 @@ class MetricExporter:
         3. Default credentials chain (boto3 default behavior)
         """
         if self.aws_assumed_role_name:
-            # assume role first
             aws_credentials = self.get_aws_account_session_via_iam_role(aws_account["Publisher"])
             return boto3.client(
                 "ce",
@@ -298,12 +314,7 @@ class MetricExporter:
                     region_name="us-east-1",
                 )
             else:
-                # no credentials are provided via the config file
-                # rely on the default credentials chain in boto3
-                return boto3.client(
-                    "ce",
-                    region_name="us-east-1",
-                )
+                return boto3.client("ce", region_name="us-east-1")
 
     def get_aws_account_session_via_iam_role(self, account_id):
         if self.aws_access_key and self.aws_access_secret:
@@ -338,7 +349,6 @@ class MetricExporter:
         results = list()
         end_date = datetime.today() - relativedelta(days=self.data_delay_days)
 
-        # Set start date based on granularity
         if self.granularity == "DAILY":
             start_date = end_date - relativedelta(days=1)
         elif self.granularity == "MONTHLY":
@@ -348,36 +358,28 @@ class MetricExporter:
             # This also makes month-to-date include the (delayed) current day.
             end_date = end_date + relativedelta(days=1)
         else:
-            # Default to daily if granularity is not recognized
             start_date = end_date - relativedelta(days=1)
 
-        # Keep the 'groups' code as specified
         groups = list()
         if group_by["enabled"]:
             for group in group_by["groups"]:
                 groups.append({"Type": group["type"], "Key": group["key"]})
 
-        # Build the base filter with RECORD_TYPE
         base_filter = {"Dimensions": {"Key": "RECORD_TYPE", "Values": self.record_types}}
         additional_filters = []
 
-        # Include tag filters if provided (existing logic)
         if tag_filters:
             for tag_filter in tag_filters:
-                tag_key = tag_filter["tag_key"]
-                tag_values = tag_filter["tag_values"]
                 additional_filters.append(
                     {
                         "Tags": {
-                            "Key": tag_key,
-                            "Values": tag_values,
+                            "Key": tag_filter["tag_key"],
+                            "Values": tag_filter["tag_values"],
                             "MatchOptions": ["EQUALS"],
                         }
                     }
                 )
 
-        # Include dimension filters if provided
-        # Dimension filters allow filtering by AWS dimensions like LINKED_ACCOUNT, SERVICE, etc.
         if dimension_filters:
             for dim_filter in dimension_filters:
                 additional_filters.append(
@@ -389,11 +391,7 @@ class MetricExporter:
                     }
                 )
 
-        # Combine the base filter and additional filters using 'And'
-        if additional_filters:
-            combined_filter = {"And": [base_filter] + additional_filters}
-        else:
-            combined_filter = base_filter
+        combined_filter = {"And": [base_filter] + additional_filters} if additional_filters else base_filter
 
         next_page_token = ""
         while True:
@@ -404,7 +402,7 @@ class MetricExporter:
                 },
                 Filter=combined_filter,
                 Granularity=self.granularity,
-                Metrics=[self.metric_type],  # Use dynamic metrics
+                Metrics=self.metric_types,
                 GroupBy=groups,
                 **({"NextPageToken": next_page_token} if next_page_token else {}),
             )

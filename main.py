@@ -179,12 +179,42 @@ def validate_configs(config):
                 )
                 sys.exit(1)
 
-        # Validate metric_type
-        if config_metric["metric_type"] not in valid_metric_types:
+        # Validate metric_type / metric_types (mutually exclusive; exactly one must be set)
+        has_metric_type = "metric_type" in config_metric
+        has_metric_types = "metric_types" in config_metric
+
+        if has_metric_type and has_metric_types:
             logging.error(
-                f"Invalid metric_type: {config_metric['metric_type']}. It must be one of {', '.join(valid_metric_types)}."
+                f"Metric '{config_metric['metric_name']}' must specify either 'metric_type' or 'metric_types', not both."
             )
             sys.exit(1)
+
+        if not has_metric_type and not has_metric_types:
+            logging.error(
+                f"Metric '{config_metric['metric_name']}' must specify either 'metric_type' or 'metric_types'."
+            )
+            sys.exit(1)
+
+        if has_metric_type:
+            if config_metric["metric_type"] not in valid_metric_types:
+                logging.error(
+                    f"Invalid metric_type: {config_metric['metric_type']}. It must be one of {', '.join(valid_metric_types)}."
+                )
+                sys.exit(1)
+
+        if has_metric_types:
+            mt_list = config_metric["metric_types"]
+            if not isinstance(mt_list, list) or len(mt_list) == 0:
+                logging.error(
+                    f"metric_types for '{config_metric['metric_name']}' must be a non-empty list."
+                )
+                sys.exit(1)
+            for mt in mt_list:
+                if mt not in valid_metric_types:
+                    logging.error(
+                        f"Invalid value in metric_types: '{mt}'. It must be one of {', '.join(valid_metric_types)}."
+                    )
+                    sys.exit(1)
 
         # Validate record_types
         if "record_types" in config_metric:
@@ -315,7 +345,8 @@ def main(config):
             targets=config["target_aws_accounts"],
             metric_name=config_metric["metric_name"],
             group_by=config_metric["group_by"],
-            metric_type=config_metric["metric_type"],
+            metric_type=config_metric.get("metric_type"),
+            metric_types=config_metric.get("metric_types"),
             data_delay_days=config_metric.get("data_delay_days", 0),
             metric_description=config_metric.get("metric_description", None),
             record_types=config_metric.get("record_types", None),

@@ -55,6 +55,10 @@ metrics:
         tag_values:
           - dev
 
+  # Example using metric_types (list) instead of metric_type (string).
+  # When metric_types is used, each exported metric gets an extra "MetricType" label
+  # so the values can be distinguished in Prometheus/Grafana queries.
+  # metric_type and metric_types are mutually exclusive — use one or the other.
   - metric_name: aws_daily_cost_usd # change the metric name if needed
     metric_description: Daily cost of an AWS account in USD
     data_delay_days: 0
@@ -75,8 +79,15 @@ metrics:
         enabled: false
         threshold: 10
         tag_value: other
-    # Allowed values for metric type are AmortizedCost, BlendedCost, NetAmortizedCost, NetUnblendedCost, NormalizedUsageAmount, UnblendedCost, and UsageQuantity
-    metric_type: AmortizedCost
+    # Use metric_types (list) to export multiple cost metrics in a single config block.
+    # Each resulting Prometheus metric will have a MetricType label, e.g.:
+    #   aws_daily_cost_usd{ServiceName="AmazonEC2", MetricType="AmortizedCost"} 42.0
+    #   aws_daily_cost_usd{ServiceName="AmazonEC2", MetricType="UnblendedCost"} 39.5
+    # Allowed values: AmortizedCost, BlendedCost, NetAmortizedCost, NetUnblendedCost,
+    #                 NormalizedUsageAmount, UnblendedCost, UsageQuantity
+    metric_types:
+      - AmortizedCost
+      - UnblendedCost
     tag_filters:
       - tag_key: "my_org:team"
         tag_values:

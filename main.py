@@ -8,6 +8,7 @@ import os
 import signal
 import sys
 import time
+from datetime import datetime, timedelta
 
 from envyaml import EnvYAML
 from prometheus_client import start_http_server
@@ -17,6 +18,23 @@ from app.exporter import MetricExporter
 
 def handle_sigint(sig, frame):
     exit()
+
+
+def get_sleep_duration(polling_interval_seconds):
+    """
+    Calculate the sleep duration ensuring it doesn't cross midnight.
+
+    This prevents scraping metrics with data from the previous day by ensuring
+    the polling wakes up at or before midnight when the next poll would otherwise
+    cross into the next day.
+    """
+    now = datetime.now()
+    midnight = datetime.combine(now.date() + timedelta(days=1), datetime.min.time())
+    seconds_until_midnight = (midnight - now).total_seconds()
+
+    # Use the smaller of polling interval or time until midnight
+    # This ensures we wake up at midnight if the poll would otherwise cross days
+    return min(polling_interval_seconds, seconds_until_midnight)
 
 
 def get_configs():
@@ -67,6 +85,22 @@ def validate_configs(config):
         "HOURLY",
         "DAILY",
         "MONTHLY",
+    ]
+
+    # Valid dimension keys for dimension_filters
+    valid_dimension_keys = [
+        "AZ",
+        "INSTANCE_TYPE",
+        "LEGAL_ENTITY_NAME",
+        "LINKED_ACCOUNT",
+        "OPERATION",
+        "PLATFORM",
+        "PURCHASE_TYPE",
+        "REGION",
+        "SERVICE",
+        "TENANCY",
+        "RECORD_TYPE",
+        "USAGE_TYPE",
     ]
 
     if len(config["target_aws_accounts"]) == 0:
@@ -155,12 +189,53 @@ def validate_configs(config):
                 )
                 sys.exit(1)
 
-        # Validate metric_type
-        if config_metric["metric_type"] not in valid_metric_types:
+        # Validate data_delay_days (optional, default 0)
+        if "data_delay_days" not in config_metric:
+            config_metric["data_delay_days"] = 0
+        else:
+            delay = config_metric["data_delay_days"]
+            if not isinstance(delay, int) or delay < 0:
+                logging.error(
+                    f"Invalid data_delay_days for metric {config_metric['metric_name']}: {delay}. It must be a non-negative integer."
+                )
+                sys.exit(1)
+
+        # Validate metric_type / metric_types (mutually exclusive; exactly one must be set)
+        has_metric_type = "metric_type" in config_metric
+        has_metric_types = "metric_types" in config_metric
+
+        if has_metric_type and has_metric_types:
             logging.error(
-                f"Invalid metric_type: {config_metric['metric_type']}. It must be one of {', '.join(valid_metric_types)}."
+                f"Metric '{config_metric['metric_name']}' must specify either 'metric_type' or 'metric_types', not both."
             )
             sys.exit(1)
+
+        if not has_metric_type and not has_metric_types:
+            logging.error(
+                f"Metric '{config_metric['metric_name']}' must specify either 'metric_type' or 'metric_types'."
+            )
+            sys.exit(1)
+
+        if has_metric_type:
+            if config_metric["metric_type"] not in valid_metric_types:
+                logging.error(
+                    f"Invalid metric_type: {config_metric['metric_type']}. It must be one of {', '.join(valid_metric_types)}."
+                )
+                sys.exit(1)
+
+        if has_metric_types:
+            mt_list = config_metric["metric_types"]
+            if not isinstance(mt_list, list) or len(mt_list) == 0:
+                logging.error(
+                    f"metric_types for '{config_metric['metric_name']}' must be a non-empty list."
+                )
+                sys.exit(1)
+            for mt in mt_list:
+                if mt not in valid_metric_types:
+                    logging.error(
+                        f"Invalid value in metric_types: '{mt}'. It must be one of {', '.join(valid_metric_types)}."
+                    )
+                    sys.exit(1)
 
         # Validate record_types
         if "record_types" in config_metric:
@@ -189,14 +264,96 @@ def validate_configs(config):
                     )
                     sys.exit(1)
 
-    # No need to repeat the validation loops; they have been consolidated above.
+        # Validate dimension_filters if present
+        # dimension_filters allow filtering by AWS dimensions like LINKED_ACCOUNT, SERVICE, etc.
+        # When iterate=true, makes N API requests and adds dimension values as labels
+        if "dimension_filters" in config_metric:
+            dimension_filters = config_metric["dimension_filters"]
+            if not isinstance(dimension_filters, list):
+                logging.error("dimension_filters should be a list.")
+                sys.exit(1)
+
+            iterate_filters = [df for df in dimension_filters if df.get("iterate", False)]
+            if len(iterate_filters) > 1:
+                logging.error("Only one dimension_filter with iterate=true is supported at a time.")
+                sys.exit(1)
+
+            for df in dimension_filters:
+                # Required fields
+                if "key" not in df:
+                    logging.error("dimension_filter must have 'key' field!")
+                    sys.exit(1)
+                if "values" not in df:
+                    logging.error("dimension_filter must have 'values' field!")
+                    sys.exit(1)
+                if not isinstance(df["values"], list):
+                    logging.error(f"dimension_filter 'values' must be a list for key '{df['key']}'!")
+                    sys.exit(1)
+                if len(df["values"]) == 0:
+                    logging.error(f"dimension_filter 'values' cannot be empty for key '{df['key']}'!")
+                    sys.exit(1)
+
+                # Validate dimension key
+                if df["key"] not in valid_dimension_keys:
+                    logging.warning(
+                        f"Unknown dimension key: {df['key']}. Valid keys are: {', '.join(valid_dimension_keys)}"
+                    )
+
+                # Validate iterate mode
+                if df.get("iterate", False):
+                    # iterate=true requires label_name
+                    if "label_name" not in df:
+                        logging.error(
+                            f"dimension_filter with iterate=true must have 'label_name' for key '{df['key']}'!"
+                        )
+                        sys.exit(1)
+
+                    # Check label_name uniqueness
+                    if df["label_name"] in group_label_names:
+                        logging.error(
+                            f"dimension_filter label_name '{df['label_name']}' conflicts with existing labels!"
+                        )
+                        sys.exit(1)
+                    if df["label_name"] in labels:
+                        logging.error(
+                            f"dimension_filter label_name '{df['label_name']}' conflicts with AWS account labels!"
+                        )
+                        sys.exit(1)
+                    group_label_names.add(df["label_name"])
+
+                    # Validate alias if present
+                    if "alias" in df:
+                        if "label_name" not in df["alias"]:
+                            logging.error(f"dimension_filter alias must have 'label_name' for key '{df['key']}'!")
+                            sys.exit(1)
+                        if "map" not in df["alias"]:
+                            logging.error(f"dimension_filter alias must have 'map' for key '{df['key']}'!")
+                            sys.exit(1)
+                        if not isinstance(df["alias"]["map"], dict):
+                            logging.error(f"dimension_filter alias 'map' must be a dictionary for key '{df['key']}'!")
+                            sys.exit(1)
+                        if df["alias"]["label_name"] in group_label_names:
+                            logging.error(
+                                f"dimension_filter alias label_name '{df['alias']['label_name']}' conflicts with existing labels!"
+                            )
+                            sys.exit(1)
+                        if df["alias"]["label_name"] in labels:
+                            logging.error(
+                                f"dimension_filter alias label_name '{df['alias']['label_name']}' conflicts with AWS account labels!"
+                            )
+                            sys.exit(1)
+                        if df["label_name"] == df["alias"]["label_name"]:
+                            logging.error(
+                                f"dimension_filter label_name and alias label_name cannot be the same for key '{df['key']}'!"
+                            )
+                            sys.exit(1)
+                        group_label_names.add(df["alias"]["label_name"])
 
 
 def main(config):
     metric_exporters = []
     for config_metric in config["metrics"]:
         # Get the aws credentials with default empty string to make it optional
-        # This is because boto3 has a default credential chain that will be used if no credentials are provided
         aws_access_key = config.get("aws_access_key", "")
         aws_access_secret = config.get("aws_access_secret", "")
         aws_assumed_role_name = config.get("aws_assumed_role_name", "")
@@ -209,9 +366,13 @@ def main(config):
             targets=config["target_aws_accounts"],
             metric_name=config_metric["metric_name"],
             group_by=config_metric["group_by"],
-            metric_type=config_metric["metric_type"],
-            record_types=config_metric.get("record_types", ["Usage"]),
+            metric_type=config_metric.get("metric_type"),
+            metric_types=config_metric.get("metric_types"),
+            data_delay_days=config_metric.get("data_delay_days", 0),
+            metric_description=config_metric.get("metric_description", None),
+            record_types=config_metric.get("record_types", None),
             tag_filters=config_metric.get("tag_filters", None),
+            dimension_filters=config_metric.get("dimension_filters", None),  # New parameter
             granularity=config_metric.get("granularity", "DAILY"),
             hourly_time_range_hours=config_metric.get("hourly_time_range_hours", 24),
         )
@@ -221,7 +382,9 @@ def main(config):
     while True:
         for exporter in metric_exporters:
             exporter.run_metrics()
-        time.sleep(config["polling_interval_seconds"])
+        sleep_duration = get_sleep_duration(config["polling_interval_seconds"])
+        logging.info(f"Sleeping for {sleep_duration:.0f} seconds (configured: {config['polling_interval_seconds']}s)")
+        time.sleep(sleep_duration)
 
 
 if __name__ == "__main__":

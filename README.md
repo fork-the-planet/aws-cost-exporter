@@ -36,9 +36,45 @@ You can specify the granularity for each metric in the `exporter_config.yaml` fi
 ```yaml
 metrics:
   - metric_name: aws_daily_cost_usd
-    granularity: DAILY  # Valid values: HOURLY, DAILY, MONTHLY.
+    metric_description: Daily AWS Usage Cost
+    granularity: DAILY  # Valid values: HOURLY, DAILY, MONTHLY
     # hourly_time_range_hours: 24  # Only used with HOURLY granularity: how many past hours to export, between 1 and 336 (14 days)
+    data_delay_days: 0  # Optional. Query N days in arrears (useful for eventual consistency, e.g. Savings Plans amortization)
     # ... other configurations
+```
+
+## Dimension Filters
+
+You can filter by AWS Cost Explorer dimensions (e.g. `SERVICE`, `LINKED_ACCOUNT`) using `dimension_filters`.
+
+Notes:
+- Only one `dimension_filter` with `iterate: true` is supported at a time.
+- `alias.label_name` must not conflict with any `target_aws_accounts` label (e.g. `Publisher`).
+
+Example:
+
+```yaml
+metrics:
+  - metric_name: aws_daily_cost_usd
+    group_by:
+      enabled: true
+      groups:
+        - type: DIMENSION
+          key: SERVICE
+          label_name: ServiceName
+    metric_type: AmortizedCost
+    dimension_filters:
+      - key: SERVICE
+        values: [AmazonEC2, AmazonS3]
+      - key: LINKED_ACCOUNT
+        values: ["123456789012", "234567890123"]
+        iterate: true
+        label_name: LinkedAccount
+        alias:
+          label_name: LinkedAccountAlias
+          map:
+            "123456789012": "prod"
+            "234567890123": "dev"
 ```
 
 ## How Does This Work
@@ -101,7 +137,7 @@ Modify the `exporter_config.yaml` file first, then use one of the following meth
 ### Docker
 
 ```
-docker run --rm -v ./exporter_config.yaml:/app/exporter_config.yaml -p 9090:9090 -e AWS_ACCESS_KEY=${AWS_ACCESS_KEY} -e AWS_ACCESS_SECRET=${AWS_ACCESS_SECRET} opensourceelectrolux/aws-cost-exporter:v1.0.11
+docker run --rm -v ./exporter_config.yaml:/app/exporter_config.yaml -p 9090:9090 -e AWS_ACCESS_KEY=${AWS_ACCESS_KEY} -e AWS_ACCESS_SECRET=${AWS_ACCESS_SECRET} opensourceelectrolux/aws-cost-exporter:v1.1.4
 ```
 
 ### Kubernetes

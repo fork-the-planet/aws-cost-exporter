@@ -135,6 +135,26 @@ def validate_configs(config):
             )
             sys.exit(1)
 
+        # Validate hourly_time_range_hours (only relevant for HOURLY granularity)
+        if config_metric["granularity"] == "HOURLY":
+            if "hourly_time_range_hours" not in config_metric:
+                logging.warning(
+                    f"hourly_time_range_hours not specified for metric {config_metric['metric_name']}, defaulting to 24"
+                )
+                config_metric["hourly_time_range_hours"] = 24
+            hourly_time_range_hours = config_metric["hourly_time_range_hours"]
+            # AWS Cost Explorer only retains hourly cost data for the past 14 days (336 hours)
+            if (
+                not isinstance(hourly_time_range_hours, int)
+                or isinstance(hourly_time_range_hours, bool)
+                or hourly_time_range_hours < 1
+                or hourly_time_range_hours > 336
+            ):
+                logging.error(
+                    f"Invalid hourly_time_range_hours: {hourly_time_range_hours}. It must be an integer between 1 and 336 (14 days)."
+                )
+                sys.exit(1)
+
         # Validate metric_type
         if config_metric["metric_type"] not in valid_metric_types:
             logging.error(
@@ -193,6 +213,7 @@ def main(config):
             record_types=config_metric.get("record_types", ["Usage"]),
             tag_filters=config_metric.get("tag_filters", None),
             granularity=config_metric.get("granularity", "DAILY"),
+            hourly_time_range_hours=config_metric.get("hourly_time_range_hours", 24),
         )
         metric_exporters.append(metric)
 

@@ -3,7 +3,7 @@
 # Filename: exporter.py
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 import boto3
 from dateutil.relativedelta import relativedelta
@@ -24,6 +24,7 @@ class MetricExporter:
         record_types=None,
         tag_filters=None,  # Added tag_filters parameter
         granularity="DAILY",
+        hourly_time_range_hours=24,
     ):
         self.polling_interval_seconds = polling_interval_seconds
         self.metric_name = metric_name
@@ -36,6 +37,7 @@ class MetricExporter:
         self.record_types = record_types
         self.tag_filters = tag_filters  # Store tag filters
         self.granularity = granularity
+        self.hourly_time_range_hours = hourly_time_range_hours
         self.dimension_alias = {}  # Store dimension value alias per group
 
         # We have verified that there is at least one target
@@ -43,6 +45,11 @@ class MetricExporter:
 
         # For now we only support exporting one type of cost (Usage)
         self.labels.add("ChargeType")
+
+        # Hourly granularity returns one datapoint per hour, so each datapoint
+        # needs a label with its period start time to avoid overwriting the others
+        if self.granularity == "HOURLY":
+            self.labels.add("PeriodStart")
 
         # If record_types is not provided, use the default value
         if record_types is None:
@@ -109,7 +116,10 @@ class MetricExporter:
         # Set start date based on granularity
         if self.granularity == "HOURLY":
             date_format = "%Y-%m-%dT%H:%M:%SZ"
-            start_date = end_date - relativedelta(seconds=self.polling_interval_seconds)
+            # Cost Explorer expects UTC timestamps; align to the top of the hour
+            # so only complete hourly datapoints are queried
+            end_date = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+            start_date = end_date - relativedelta(hours=self.hourly_time_range_hours)
 
         elif self.granularity == "DAILY":
             start_date = end_date - relativedelta(days=1)
@@ -207,9 +217,15 @@ class MetricExporter:
         )
 
         for result in cost_response:
+            # With hourly granularity every result is one hour's datapoint,
+            # exposed as its own time series via the PeriodStart label
+            period_labels = dict()
+            if self.granularity == "HOURLY":
+                period_labels["PeriodStart"] = result["TimePeriod"]["Start"]
+
             if not self.group_by["enabled"]:
                 cost = float(result["Total"][self.metric_type]["Amount"])
-                self.cost_metric.labels(**aws_account, ChargeType="Usage").set(cost)
+                self.cost_metric.labels(**aws_account, **period_labels, ChargeType="Usage").set(cost)
             else:
                 merged_minor_cost = 0
                 for item in result["Groups"]:
@@ -240,7 +256,9 @@ class MetricExporter:
                     ):
                         merged_minor_cost += cost
                     else:
-                        self.cost_metric.labels(**aws_account, **group_key_values, ChargeType="Usage").set(cost)
+                        self.cost_metric.labels(
+                            **aws_account, **group_key_values, **period_labels, ChargeType="Usage"
+                        ).set(cost)
 
                 if merged_minor_cost > 0:
                     group_key_values = dict()
@@ -256,6 +274,6 @@ class MetricExporter:
                                 group_key_values[alias["label"]] = alias_value
                         else:
                             group_key_values[group["label_name"]] = merged_value
-                    self.cost_metric.labels(**aws_account, **group_key_values, ChargeType="Usage").set(
-                        merged_minor_cost
-                    )
+                    self.cost_metric.labels(
+                        **aws_account, **group_key_values, **period_labels, ChargeType="Usage"
+                    ).set(merged_minor_cost)

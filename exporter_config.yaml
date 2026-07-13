@@ -8,7 +8,8 @@ aws_assumed_role_name: $AWS_ASSUMED_ROLE|"" # Optional. When empty, will use the
 metrics:
   - metric_name: aws_daily_cost_by_service_by_account # change the metric name if needed
     # metric_description: Daily cost by service by account
-    granularity: DAILY
+    granularity: DAILY # Valid values: HOURLY, DAILY, MONTHLY
+    # hourly_time_range_hours: 24 # only used with HOURLY granularity: how many past hours to export, between 1 and 336 (14 days)
     group_by:
       enabled: true
       # Cost data can be groupped using up to two different groups: DIMENSION, TAG, COST_CATEGORY.

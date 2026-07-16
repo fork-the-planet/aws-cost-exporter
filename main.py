@@ -169,6 +169,17 @@ def validate_configs(config):
             )
             sys.exit(1)
 
+        # Validate data_delay_days (optional, default 0)
+        if "data_delay_days" not in config_metric:
+            config_metric["data_delay_days"] = 0
+        else:
+            delay = config_metric["data_delay_days"]
+            if not isinstance(delay, int) or delay < 0:
+                logging.error(
+                    f"Invalid data_delay_days for metric {config_metric['metric_name']}: {delay}. It must be a non-negative integer."
+                )
+                sys.exit(1)
+
         # Validate hourly_time_range_hours (only relevant for HOURLY granularity)
         if config_metric["granularity"] == "HOURLY":
             if "hourly_time_range_hours" not in config_metric:
@@ -188,15 +199,14 @@ def validate_configs(config):
                     f"Invalid hourly_time_range_hours: {hourly_time_range_hours}. It must be an integer between 1 and 336 (14 days)."
                 )
                 sys.exit(1)
-
-        # Validate data_delay_days (optional, default 0)
-        if "data_delay_days" not in config_metric:
-            config_metric["data_delay_days"] = 0
-        else:
-            delay = config_metric["data_delay_days"]
-            if not isinstance(delay, int) or delay < 0:
+            # data_delay_days shifts the whole query window into the past, so the delayed
+            # start must still fall within the 14-day hourly retention window
+            if hourly_time_range_hours + config_metric["data_delay_days"] * 24 > 336:
                 logging.error(
-                    f"Invalid data_delay_days for metric {config_metric['metric_name']}: {delay}. It must be a non-negative integer."
+                    f"Invalid configuration for metric {config_metric['metric_name']}: "
+                    f"hourly_time_range_hours ({hourly_time_range_hours}) + data_delay_days "
+                    f"({config_metric['data_delay_days']}) * 24 exceeds 336 hours. AWS Cost Explorer "
+                    "only retains hourly cost data for the past 14 days."
                 )
                 sys.exit(1)
 

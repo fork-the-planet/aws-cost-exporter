@@ -27,6 +27,7 @@ _ps: As the metric name indicate, the metric shows the daily costs in USD. `Dail
 
 The exporter supports different granularities for cost metrics:
 
+- **HOURLY**: Exports one datapoint per hour over the past `hourly_time_range_hours` hours (default: 24, max: 336 as AWS only retains hourly cost data for 14 days). Each datapoint is exposed as a separate time series with a `PeriodStart` label indicating the start of the hour (UTC). Since `data_delay_days` shifts the whole query window into the past, `hourly_time_range_hours + data_delay_days * 24` must not exceed 336. Hourly granularity requires opt-in from the AWS Cost Explorer Settings page and will incur additional charges.
 - **DAILY**: Exports the cost for the previous day.
 - **MONTHLY**: Exports month-to-date costs (from the first day of the current month to now).
 
@@ -36,7 +37,8 @@ You can specify the granularity for each metric in the `exporter_config.yaml` fi
 metrics:
   - metric_name: aws_daily_cost_usd
     metric_description: Daily AWS Usage Cost
-    granularity: DAILY  # Valid values: DAILY, MONTHLY
+    granularity: DAILY  # Valid values: HOURLY, DAILY, MONTHLY
+    # hourly_time_range_hours: 24  # Only used with HOURLY granularity: how many past hours to export, between 1 and 336 (14 days, minus data_delay_days * 24)
     data_delay_days: 0  # Optional. Query N days in arrears (useful for eventual consistency, e.g. Savings Plans amortization)
     # ... other configurations
 ```

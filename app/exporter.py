@@ -4,7 +4,7 @@
 
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 import boto3
 from dateutil.relativedelta import relativedelta
@@ -36,6 +36,7 @@ class MetricExporter:
         tag_filters=None,
         dimension_filters=None,
         granularity="DAILY",
+        hourly_time_range_hours=24,
     ):
         self.polling_interval_seconds = polling_interval_seconds
         self.metric_name = metric_name
@@ -45,6 +46,7 @@ class MetricExporter:
         self.aws_assumed_role_name = aws_assumed_role_name
         self.group_by = group_by
         self.data_delay_days = data_delay_days
+        self.hourly_time_range_hours = hourly_time_range_hours
         self.metric_description = metric_description
         self.tag_filters = tag_filters
         self.granularity = granularity
@@ -81,6 +83,11 @@ class MetricExporter:
         # We have verified that there is at least one target
         self.labels = set(targets[0].keys())
         self.labels.add("ChargeType")
+
+        # Hourly granularity returns one datapoint per hour, so each datapoint
+        # needs a label with its period start time to avoid overwriting the others
+        if self.granularity == "HOURLY":
+            self.labels.add("PeriodStart")
 
         # When using metric_types, add MetricType as a label dimension.
         if self.add_metric_type_label:
@@ -252,11 +259,19 @@ class MetricExporter:
         )
 
         for result in cost_response:
+            # With hourly granularity every result is one hour's datapoint,
+            # exposed as its own time series via the PeriodStart label
+            period_labels = {}
+            if self.granularity == "HOURLY":
+                period_labels["PeriodStart"] = result["TimePeriod"]["Start"]
+
             if not self.group_by["enabled"]:
                 for metric_type in self.metric_types:
                     cost = float(result["Total"][metric_type]["Amount"])
                     type_label = {METRIC_TYPE_LABEL: metric_type} if self.add_metric_type_label else {}
-                    self.cost_metric.labels(**aws_account, **extra_labels, **type_label, ChargeType="Usage").set(cost)
+                    self.cost_metric.labels(
+                        **aws_account, **extra_labels, **period_labels, **type_label, ChargeType="Usage"
+                    ).set(cost)
             else:
                 # Track merged minor costs separately per metric type so that the threshold
                 # check is applied independently for each cost view.
@@ -276,7 +291,12 @@ class MetricExporter:
                             merged_minor_costs[metric_type] += cost
                         else:
                             self.cost_metric.labels(
-                                **aws_account, **extra_labels, **group_key_values, **type_label, ChargeType="Usage"
+                                **aws_account,
+                                **extra_labels,
+                                **group_key_values,
+                                **period_labels,
+                                **type_label,
+                                ChargeType="Usage",
                             ).set(cost)
 
                 merged_group_key_values = self._build_merged_group_key_values()
@@ -284,7 +304,12 @@ class MetricExporter:
                     if merged_cost > 0:
                         type_label = {METRIC_TYPE_LABEL: metric_type} if self.add_metric_type_label else {}
                         self.cost_metric.labels(
-                            **aws_account, **extra_labels, **merged_group_key_values, **type_label, ChargeType="Usage"
+                            **aws_account,
+                            **extra_labels,
+                            **merged_group_key_values,
+                            **period_labels,
+                            **type_label,
+                            ChargeType="Usage",
                         ).set(merged_cost)
 
     def _get_aws_client(self, aws_account):
@@ -347,10 +372,20 @@ class MetricExporter:
             List of ResultsByTime from AWS Cost Explorer response
         """
         results = list()
+        date_format = "%Y-%m-%d"
         end_date = datetime.today() - relativedelta(days=self.data_delay_days)
 
-        if self.granularity == "DAILY":
+        if self.granularity == "HOURLY":
+            date_format = "%Y-%m-%dT%H:%M:%SZ"
+            # Cost Explorer expects UTC timestamps; align to the top of the hour
+            # so only complete hourly datapoints are queried
+            end_date = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0) - relativedelta(
+                days=self.data_delay_days
+            )
+            start_date = end_date - relativedelta(hours=self.hourly_time_range_hours)
+        elif self.granularity == "DAILY":
             start_date = end_date - relativedelta(days=1)
+
         elif self.granularity == "MONTHLY":
             # First day of month (relative to the delayed end_date) for month-to-date
             start_date = datetime(end_date.year, end_date.month, 1)
@@ -397,8 +432,8 @@ class MetricExporter:
         while True:
             response = aws_client.get_cost_and_usage(
                 TimePeriod={
-                    "Start": start_date.strftime("%Y-%m-%d"),
-                    "End": end_date.strftime("%Y-%m-%d"),
+                    "Start": start_date.strftime(date_format),
+                    "End": end_date.strftime(date_format),
                 },
                 Filter=combined_filter,
                 Granularity=self.granularity,

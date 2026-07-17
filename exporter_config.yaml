@@ -8,6 +8,8 @@ aws_assumed_role_name: $AWS_ASSUMED_ROLE|"" # Optional. When empty, will use the
 metrics:
   - metric_name: aws_daily_cost_by_service_by_account # change the metric name if needed
     metric_description: Daily cost of an AWS account in USD by service and account
+    granularity: DAILY # Valid values: HOURLY, DAILY, MONTHLY
+    # hourly_time_range_hours: 24 # only used with HOURLY granularity: how many past hours to export, between 1 and 336 (14 days, minus data_delay_days * 24)
     # Optional. Query cost data N days in arrears (e.g. set to 1-2 for Savings Plans amortization stability).
     # For DAILY, this exports the day (today - data_delay_days - 1).
     # For MONTHLY, this exports month-to-date as of (today - data_delay_days).
@@ -61,6 +63,7 @@ metrics:
   # metric_type and metric_types are mutually exclusive — use one or the other.
   - metric_name: aws_daily_cost_usd # change the metric name if needed
     metric_description: Daily cost of an AWS account in USD
+    granularity: DAILY
     data_delay_days: 0
     group_by:
       enabled: true

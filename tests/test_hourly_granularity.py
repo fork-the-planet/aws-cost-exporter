@@ -135,11 +135,21 @@ class TestHourlyTimeWindow:
 
 class TestPeriodStartLabel:
     def _build_hourly_response(self, *period_starts):
-        """Build a fake CE response with one grouped $5 datapoint per hourly bucket."""
+        """
+        Build a fake CE response with one grouped $5 datapoint per hourly bucket.
+
+        Note: this helper only produces *grouped* responses (each entry has
+        ``Groups`` and an empty ``Total``), so it is only valid for exporters with
+        ``group_by`` enabled. The non-grouped code path reads ``result["Total"]``
+        and would KeyError on this shape.
+
+        ``End`` is set to a sentinel that differs from every ``Start`` so the tests
+        prove the ``PeriodStart`` label is sourced from ``Start`` (not ``End``).
+        """
         return {
             "ResultsByTime": [
                 {
-                    "TimePeriod": {"Start": start, "End": start},
+                    "TimePeriod": {"Start": start, "End": "2999-01-01T00:00:00Z"},
                     "Total": {},
                     "Groups": [
                         {"Keys": ["AmazonEC2"], "Metrics": {"UnblendedCost": {"Amount": "5.00", "Unit": "USD"}}}
@@ -266,6 +276,22 @@ class TestHourlyTimeRangeValidation:
         validate_configs(config)
 
         assert "hourly_time_range_hours" not in config["metrics"][0]
+
+    def test_set_on_non_hourly_metric_warns(self, caplog):
+        """Setting hourly_time_range_hours on a non-HOURLY metric warns but does not fail."""
+        config = _make_config(granularity="DAILY", hourly_time_range_hours=48)
+        validate_configs(config)
+
+        assert "will be ignored" in caplog.text
+        # The value is left untouched (not validated against the 1..336 bounds).
+        assert config["metrics"][0]["hourly_time_range_hours"] == 48
+
+    def test_no_warning_when_hourly(self, caplog):
+        """A valid HOURLY metric must not emit the ignored-value warning."""
+        config = _make_config(granularity="HOURLY", hourly_time_range_hours=48)
+        validate_configs(config)
+
+        assert "will be ignored" not in caplog.text
 
 
 class TestHourlyRetentionWithDataDelay:

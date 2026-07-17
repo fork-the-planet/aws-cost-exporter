@@ -209,6 +209,13 @@ def validate_configs(config):
                     "only retains hourly cost data for the past 14 days."
                 )
                 sys.exit(1)
+        # hourly_time_range_hours has no effect unless granularity is HOURLY; warn so a
+        # misplaced setting (e.g. left on a DAILY metric) doesn't silently do nothing
+        elif "hourly_time_range_hours" in config_metric:
+            logging.warning(
+                f"hourly_time_range_hours is set for metric {config_metric['metric_name']} but granularity is "
+                f"{config_metric['granularity']}, not HOURLY; the value will be ignored."
+            )
 
         # Validate metric_type / metric_types (mutually exclusive; exactly one must be set)
         has_metric_type = "metric_type" in config_metric

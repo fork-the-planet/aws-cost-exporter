@@ -85,7 +85,10 @@ class MetricExporter:
         self.labels.add("ChargeType")
 
         # Hourly granularity returns one datapoint per hour, so each datapoint
-        # needs a label with its period start time to avoid overwriting the others
+        # needs a label with its period start time to avoid overwriting the others.
+        # Note: the hour's event time therefore lives in this label, not in the
+        # Prometheus sample timestamp (which is scrape time) — see the "Querying
+        # HOURLY metrics" section in README.md for the query implications.
         if self.granularity == "HOURLY":
             self.labels.add("PeriodStart")
 
@@ -385,7 +388,6 @@ class MetricExporter:
             start_date = end_date - relativedelta(hours=self.hourly_time_range_hours)
         elif self.granularity == "DAILY":
             start_date = end_date - relativedelta(days=1)
-
         elif self.granularity == "MONTHLY":
             # First day of month (relative to the delayed end_date) for month-to-date
             start_date = datetime(end_date.year, end_date.month, 1)

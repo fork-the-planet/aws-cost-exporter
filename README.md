@@ -37,17 +37,27 @@ You can specify the granularity for each metric in the `exporter_config.yaml` fi
 metrics:
   - metric_name: aws_daily_cost_usd
     metric_description: Daily AWS Usage Cost
-    granularity: DAILY  # Valid values: HOURLY, DAILY, MONTHLY
+    granularity: DAILY # Valid values: HOURLY, DAILY, MONTHLY
     # hourly_time_range_hours: 24  # Only used with HOURLY granularity: how many past hours to export, between 1 and 336 (14 days, minus data_delay_days * 24)
-    data_delay_days: 0  # Optional. Query N days in arrears (useful for eventual consistency, e.g. Savings Plans amortization)
+    data_delay_days: 0 # Optional. Query N days in arrears (useful for eventual consistency, e.g. Savings Plans amortization)
     # ... other configurations
 ```
+
+### Querying HOURLY metrics
+
+HOURLY metrics behave differently from `DAILY`/`MONTHLY` in Prometheus and need care when querying:
+
+- Every poll re-fetches the whole `hourly_time_range_hours` window, so at any moment the exporter exposes **one series per hour** in that window, each distinguished by its `PeriodStart` label. The value's real event time lives in the `PeriodStart` label, **not** in the Prometheus sample timestamp (which is just the scrape time). Because of this, standard time-axis functions like `rate()` and `increase()` are not meaningful on these series.
+- To chart the actual per-hour cost, aggregate by the `PeriodStart` label, e.g. `sum by (PeriodStart) (aws_hourly_cost_usd)`, and treat `PeriodStart` as the x-axis dimension.
+- Avoid naive whole-metric aggregations like `sum(aws_hourly_cost_usd)`: since ~`hourly_time_range_hours` past hours are live simultaneously, they will be summed together and **double-count**. Always constrain to a single `PeriodStart` (or aggregate `by (PeriodStart)`) first.
+- Re-fetching the full window each poll makes the metric self-healing: late-arriving or corrected AWS data is picked up on the next poll, as long as the window is longer than AWS's publishing delay. This is why the window is decoupled from `polling_interval_seconds`.
 
 ## Dimension Filters
 
 You can filter by AWS Cost Explorer dimensions (e.g. `SERVICE`, `LINKED_ACCOUNT`) using `dimension_filters`.
 
 Notes:
+
 - Only one `dimension_filter` with `iterate: true` is supported at a time.
 - `alias.label_name` must not conflict with any `target_aws_accounts` label (e.g. `Publisher`).
 
@@ -84,6 +94,7 @@ AWS Cost Metrics Exporter fetches cost data from a list of AWS accounts, each of
 ![aws-cost-exporter-design](doc/images/aws-cost-exporter-design.png)
 
 ## How Does Exporter Use AWS Credentials
+
 This exporter is implemented with [AWS Boto3 SDK](https://boto3.amazonaws.com/v1/documentation/api/latest/index.html) and it follows the order in which Boto3 searches for credentials (see the official docs [here](https://boto3.amazonaws.com/v1/documentation/api/latest/guide/credentials.html#configuring-credentials)). The only difference is that, when `aws_access_key` and `aws_secret_key` are defined in the `exporter_config.yaml` file, the exporter will use these credentials and authenticate as an IAM user.
 
 ## Setup AWS IAM User, Role, and Policy
